@@ -1,0 +1,9 @@
+[2026-05-08 19:35:28] {"workout_history": [{"exercise": "lateral_raise", "total_reps": 5}]}
+[2026-05-08 19:38:30] {"workout_history": [{"exercise": "shoulder_press", "total_reps": 0}]}
+[2026-05-08 19:45:55] {"workout_history": []}
+[2026-05-08 19:50:26] {"workout_history": []}
+[2026-05-08 19:51:41] {"workout_history": []}
+[2026-05-08 22:31:36] {"workout_history": []}
+[2026-05-10 14:34:17] {"workout_history": [{"exercise": "bicep_curl", "total_reps": 4}]}
+[2026-05-10 14:44:48] {"workout_history": [{"exercise": "squat", "total_reps": 6}, {"exercise": "bicep_curl", "total_reps": 3}]}
+[2026-05-10 14:54:55] {"workout_history": [{"exercise": "bicep_curl", "total_reps": 6, "good_form": true}]}
