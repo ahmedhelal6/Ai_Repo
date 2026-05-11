@@ -916,7 +916,7 @@ class RealtimePipeline:
                 self.countdown_finished = True
 
         # =================================================
-        # BUFFER
+        # BUFFER (Starts only after countdown)
         # =================================================
         self.sequence_buffer.append(features)
         if len(self.sequence_buffer) > self.seq_len:
@@ -946,7 +946,7 @@ class RealtimePipeline:
             from collections import Counter
             
             self.inference_counter += 1
-            if self.inference_counter % 5 == 0:
+            if self.inference_counter % 3 == 0:
                 seq_np = np.array(self.sequence_buffer, dtype=np.float32)
                 inp = self._build_input(seq_np).to(self.device)
                 

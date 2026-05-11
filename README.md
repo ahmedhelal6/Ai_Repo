@@ -1,257 +1,102 @@
-       # 🏋️ AI Fitness Coach
+# AI Fitness Coach 🏋️‍♂️
 
-An AI-powered real-time fitness coaching system that uses **ST-GCN (Spatial-Temporal Graph Convolutional Network)** for exercise classification and **rule-based angle analysis** for repetition counting and form evaluation. The system runs as a **client-server architecture** with a Flutter mobile app and a Python FastAPI backend.
+An end-to-end, real-time AI fitness coaching ecosystem. This project combines a high-performance **Flutter** mobile application with a **FastAPI** backend powered by **Spatial-Temporal Graph Convolutional Networks (ST-GCN)**.
 
----
-
-## 📐 System Architecture
-
-```
-┌─────────────────────────────┐         WebSocket (Binary)        ┌──────────────────────────────┐
-│      Flutter Mobile App     │  ──────────────────────────────►  │     Python FastAPI Server     │
-│                             │                                   │                               │
-│  • Camera Capture           │         JSON Response             │  • ST-GCN Model (PyTorch)     │
-│  • ML Kit Pose Detection    │  ◄──────────────────────────────  │  • Rep Counter (Angle-based)  │
-│  • Real-time HUD Display    │                                   │  • Session Manager            │
-│  • Workout Report UI        │                                   │  • Form Evaluation            │
-└─────────────────────────────┘                                   └──────────────────────────────┘
-```
+It doesn't just count reps; it understands human motion, provides real-time form correction, and generates comprehensive performance reports.
 
 ---
 
-## 🧠 Supported Exercises
+## 🚀 Key Features
 
-| Exercise         | Mode         | Primary Joints Tracked              |
-|------------------|--------------|--------------------------------------|
-| Bicep Curl       | up_down_up   | Shoulder → Elbow → Wrist            |
-| Squat            | down_up      | Hip → Knee → Ankle                  |
-| Deadlift         | down_up      | Shoulder → Hip → Knee               |
-| Shoulder Press   | up_down_up   | Hip → Shoulder → Elbow              |
-| Lateral Raise    | up_down_up   | Elbow → Shoulder → Hip              |
-| Push-up          | down_up      | Shoulder → Elbow → Wrist            |
+- **🤖 Automated AI Classification**: Uses ST-GCN to automatically identify the exercise you are performing without manual selection.
+- **⏱️ Hands-Free Experience**: Intelligent countdowns and motion-triggered starts allow you to focus entirely on your workout.
+- **📢 Real-Time Form Correction**: Instant feedback banners guide you to maintain proper posture and technique.
+- **📊 Dynamic Workout Reports**: Get a detailed breakdown of your performance, including total reps, accuracy, and form consistency.
+- **🧠 Intelligent Session Control**: Automatically pauses the session if you stop moving, and provides easy options to Resume or Restart.
+- **⚡ Low-Latency Performance**: Optimized for mobile devices with high-speed server-side inference.
+- **🔒 Privacy-First Design**: Video processing happens on-device; only numerical landmark data is sent to the server. No video is ever stored or transmitted.
+- **📈 Comprehensive Exercise Library**: Native support for Squats, Push-ups, Bicep Curls, Deadlifts, Shoulder Press, and Lateral Raises.
+- **🔊 Visual & Textual Guidance**: Immediate on-screen alerts for form correction and performance encouragement.
+- **⚙️ Physics-Based Counting**: Uses trigonometric rules and joint-angle analysis for 100% accurate repetition tracking.
 
 ---
 
-## 1. AI Backend (Python)
+## 🌟 The Experience (User Journey)
 
-### 1.1 Prerequisites
+1.  **Smart Detection**: As soon as you stand in front of the camera, the app identifies your presence.
+2.  **Countdown & Prep**: Once motion is detected, a large, premium countdown appears (3... 2... 1...) to give you time to get into position.
+3.  **Real-Time Coaching**: During your set, the app shows:
+    - **Live Rep Counter**: Updates instantly as you complete movements.
+    - **Stage Tracking**: Shows if you are currently in the "UP" or "DOWN" phase.
+    - **Form Feedback**: Dynamic banners warn you about form issues (e.g., "Keep elbows tucked").
+4.  **Intelligent Pause**: If you stop moving for 5 seconds, the app automatically pauses and shows a decision menu (Resume / Restart / Finish).
+5.  **Workout Report**: After finishing, a sleek overlay presents your total reps, accuracy, and a breakdown of each exercise performed.
 
-1. **Python 3.10+** (recommended via [Anaconda](https://www.anaconda.com/))
-2. **PyTorch** (CPU or CUDA)
-3. **pip** or **conda** package manager
-4. **Trained model weights** (`best_model.pth`) — must be in the project root
+---
 
-### 1.2 Installation
+## 📱 Frontend Deep Dive (Flutter)
 
-```bash
-# Clone the repository
-git clone https://github.com/ahmedhelal6/Ai_Repo.git
-cd Ai_Repo
+The mobile app is built for speed and responsiveness:
+-   **Pose Extraction**: Uses **Google ML Kit** to extract 33 skeletal landmarks directly on the device.
+-   **Throttled Transmission**: To ensure stability on all network types, landmarks are sent to the server at a steady.
+-   **Z-Axis Normalization**: Custom logic scales the Z-depth relative to frame width to ensure coordinate consistency across different devices.
+-   **Premium UI**:
+    -   **Glassmorphism Overlays**: Modern, semi-transparent menus for Pause and Reports.
+    -   **Dynamic HUD**: A specialized bottom bar that tracks Exercise Name, Reps, and Stage.
 
-# Create and activate conda environment (recommended)
-conda create -n ml python=3.10 -y
-conda activate ml
+---
 
-# Install PyTorch (CPU version — for GPU, visit https://pytorch.org)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+## ⚙️ Backend Deep Dive (FastAPI & AI)
 
-# Install project dependencies
-pip install fastapi uvicorn numpy mediapipe opencv-python
-```
+The server acts as the "Brain" of the system:
+-   **State Machine Pipeline**: Manages the session state (`IDLE`, `COUNTDOWN`, `BUFFERING`, `ACTIVE`).
+-   **ST-GCN Classification**: A Deep Learning model that analyzes a **30-frame sequence** of movement. It doesn't just look at one frame; it looks at the *timing* and *spatial relationship* of your joints over time.
+-   **Rule Engine (`rules.py`)**:
+    -   Calculates precise angles (e.g., Elbow angle for Bicep Curls, Hip angle for Squats).
+    -   Uses thresholds and "Stage Logic" to ensure a rep is only counted if the full range of motion is achieved.
+-   **Performance Optimization**: Implements **Inference Skipping** (running the heavy AI model only once every 10 frames) while keeping the rule-engine running every frame for instant counting.
 
-### 1.3 Running the Backend Server
+---
 
-```bash
-# Make sure you are in the project root directory
-cd Ai_Repo
+## 📂 Project Architecture
 
-# Activate the environment
-conda activate ml
-
-# Start the WebSocket API server
-python api.py
-```
-
-The server will start on `http://0.0.0.0:8000`. You should see:
-```
-✅ ST-GCN Loaded: 4 channels, 39 joints
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-```
-
-> **⚠️ Important:** The server must be running **before** launching the Flutter app. Both the phone and the PC must be connected to the **same WiFi network**.
-
-### 1.4 Project Structure (Python)
-
-```
-Ai_Repo/
-├── api.py                          # FastAPI WebSocket server (entry point)
-├── app.py                          # Local camera version (standalone, for testing)
-├── best_model.pth                  # Trained ST-GCN model weights
-│
+```text
+├── ai_fit/flutter/         # Full Flutter project
+│   └── lib/views/          # AI Coach Screen & UI Logic
 ├── src/
-│   ├── core/
-│   │   └── config.py               # Global settings & paths
-│   │
-│   ├── pipeline/
-│   │   └── realtime_pipeline.py    # Main controller — motion detection, classification, rep counting
-│   │
-│   ├── model/
-│   │   └── stgcn.py                # ST-GCN neural network (Spatial-Temporal Graph CNN)
-│   │
-│   ├── pose/
-│   │   ├── extractor.py            # MediaPipe wrapper — keypoint extraction & normalization
-│   │   ├── joints.py               # Joint indices, class labels, skeleton edges
-│   │   └── normalization.py        # Keypoint normalization logic
-│   │
-│   ├── counter/
-│   │   ├── rep_counter.py          # Repetition counter — stage detection (up/down) with confirmation
-│   │   ├── rules.py                # Per-exercise config — angles, thresholds, form checks
-│   │   └── angles.py               # Angle calculation between 3 joints
-│   │
-│   ├── session/
-│   │   └── session_manager.py      # Session state, workout history, report generation
-│   │
-│   └── ui/                         # OpenCV UI overlays (used in standalone app.py mode)
-│
-├── model_train/                    # Training scripts for ST-GCN
-├── pose_landmark_model/            # MediaPipe .task model file
-└── reports/                        # Saved workout reports
-```
-
-### 1.5 API Endpoints
-
-| Endpoint                   | Type      | Description                                |
-|----------------------------|-----------|--------------------------------------------|
-| `ws://<IP>:8000/ws/<id>`   | WebSocket | Main communication channel                 |
-
-**WebSocket Message Types:**
-
-| Direction       | Format  | Content                                      |
-|-----------------|---------|----------------------------------------------|
-| Mobile → Server | Binary  | 132 Float32 values (33 landmarks × 4 values) |
-| Mobile → Server | JSON    | `{"command": "resume" / "finish" / "restart"}` |
-| Server → Mobile | JSON    | State update: exercise, reps, stage, feedback |
-| Server → Mobile | JSON    | `{"type": "REPORT", "data": {...}}`           |
-
----
-
-## 2. Flutter Mobile App
-
-### 2.1 Prerequisites
-
-1. **Flutter SDK** (3.10+)
-2. **Dart SDK** (included with Flutter)
-3. **Android Studio** or **VS Code** with Flutter extension
-4. **Android device** (physical, connected via USB) or Android Emulator
-
-### 2.2 Installation
-
-```bash
-# Navigate to the Flutter project directory
-cd Ai_Repo/ai_fit/flutter
-
-# Install dependencies
-flutter pub get
-```
-
-### 2.3 Configuration
-
-Before running, update the server IP address in the Flutter code to match your PC's local IP:
-
-**File:** `lib/views/aicoachscreen.dart` (Line 12)
-```dart
-const String _kPythonHost = '192.168.1.12'; // ← Change to your PC's IP
-```
-
-To find your PC's IP:
-```bash
-# Windows
-ipconfig
-# Look for "IPv4 Address" under your WiFi adapter
-```
-
-### 2.4 Running the App
-
-```bash
-# Make sure you are in the Flutter project directory
-cd Ai_Repo/ai_fit/flutter
-
-# Run on connected Android device
-flutter run
-```
-
-### 2.5 Flutter Dependencies
-
-| Package                        | Purpose                              |
-|--------------------------------|--------------------------------------|
-| `camera`                       | Camera stream capture                |
-| `google_mlkit_pose_detection`  | On-device pose detection (33 joints) |
-| `web_socket_channel`           | WebSocket communication with server  |
-
-### 2.6 Flutter Project Structure
-
-```
-ai_fit/flutter/
-├── lib/
-│   ├── main.dart                   # App entry point & routing
-│   ├── views/
-│   │   └── aicoachscreen.dart      # AI Coach screen — camera, ML Kit, WebSocket, HUD
-│   ├── controllers/                # Business logic controllers
-│   ├── models/                     # Data models
-│   ├── services/                   # Backend services
-│   ├── widgets/                    # Reusable UI components
-│   └── core/                      # Theme, constants
-├── assets/                         # Images & icons
-├── android/                        # Android platform config
-└── pubspec.yaml                    # Flutter dependencies
+│   ├── pipeline/           # RealtimePipeline (State Management)
+│   ├── counter/            # RepCounter & ExerciseRules (Math & Logic)
+│   └── models/             # SimpleSTGCN PyTorch Definition
+├── api.py                  # WebSocket Server (The Bridge)
+├── best_model.pth          # Trained ST-GCN Weights
+└── README.md               # You are here!
 ```
 
 ---
 
-## 3. How It Works (Data Flow)
+## 🚀 Installation & Setup
 
-```
-1. 📱 Camera captures frame
-          │
-2. 🤖 ML Kit detects 33 body landmarks on-device
-          │
-3. 📡 Landmarks sent as binary Float32 via WebSocket
-          │
-4. 🖥️ Python server receives & reconstructs landmarks
-          │
-5. 🧮 PoseExtractor normalizes keypoints (33 → 39 joints with angles)
-          │
-6. 🧠 ST-GCN classifies exercise type (if not locked)
-          │
-7. 📐 RepCounter tracks angles & counts reps (up/down stages)
-          │
-8. ✅ Form evaluation checks secondary angles for quality
-          │
-9. 📤 JSON response sent back: {exercise, reps, stage, feedback}
-          │
-10. 📱 Flutter HUD updates in real-time
-```
+### 1. Server Setup (Python)
+1.  **Install dependencies**: `pip install -r requirements.txt`
+2.  **Run the server**: `python api.py`
+3.  **Local IP**: Find your PC's IP address (e.g., `192.168.1.5`).
+
+### 2. Mobile Setup (Flutter)
+1.  **Configure IP**: Update `_kPythonHost` in `lib/views/aicoachscreen.dart`.
+2.  **Install & Run**: `flutter pub get` then `flutter run`.
 
 ---
 
-## 4. Quick Start (Full Setup)
+## 📋 Supported Exercises
 
-**Terminal 1 — Start the Python server:**
-```bash
-cd Ai_Repo
-conda activate ml
-python api.py
-```
+| Exercise | Primary Landmarks | Goal |
+| :--- | :--- | :--- |
+| **Squat** | Hip, Knee, Ankle | Deep sit, full stand |
+| **Bicep Curl** | Shoulder, Elbow, Wrist | Full contraction, no swing |
+| **Deadlift** | Shoulder, Hip, Knee | Straight back, full lockout |
+| **Push-up** | Shoulder, Elbow, Wrist | Chest to ground, full lock |
 
-**Terminal 2 — Run the Flutter app:**
-```bash
-cd Ai_Repo/ai_fit/flutter
-flutter run
-```
+---
 
-> **📌 Checklist before running:**
-> - [ ] Phone and PC on the same WiFi network
-> - [ ] Correct IP address set in `aicoachscreen.dart`
-> - [ ] `best_model.pth` exists in the project root
-> - [ ] Python server is running and shows "Uvicorn running"
-> - [ ] Phone is connected via USB with USB debugging enabled
+## 📄 License
+Licensed under the MIT License. Built with ❤️ for the AI Fitness Community.
