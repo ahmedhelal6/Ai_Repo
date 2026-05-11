@@ -273,13 +273,10 @@ EXERCISE_COUNTER_RULES = {
             ),
         },
 
-        "full_angle": 175,
-
-        "contract_angle": 120,
-
-        "mode": "down_up",
-
-        "start_stage": "down",
+        "full_angle": 170,
+        "contract_angle": 110,
+        "mode": "up_down_up",
+        "start_stage": "up",
 
         "form_checks": [
             {

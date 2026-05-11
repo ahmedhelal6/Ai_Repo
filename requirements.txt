@@ -1,0 +1,30 @@
+# ============================================================
+# AI Fitness Coach — Python Dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+#
+# Note: For PyTorch with GPU (CUDA 12.1), use:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# For CPU-only PyTorch, use:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# ============================================================
+
+# --- Core AI / Deep Learning ---
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# --- Pose Estimation ---
+mediapipe==0.10.11
+
+# --- Numerical / Scientific ---
+numpy==2.0.1
+scikit-learn==1.8.0
+
+# --- Computer Vision ---
+opencv-python==4.10.0.84
+
+# --- Web Server (API) ---
+fastapi==0.136.1
+uvicorn==0.46.0

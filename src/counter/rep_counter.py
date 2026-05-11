@@ -1,5 +1,5 @@
 class RepCounter:
-    def __init__(self, config, min_frames_confirm=3):
+    def __init__(self, config, min_frames_confirm=2):
         self.config = config
         self.reps = 0
         self.stage = config.get("start_stage", None)

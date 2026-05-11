@@ -26,7 +26,7 @@ from src.counter.angles import calculate_angle
 # =========================================================
 class RealtimePipeline:
 
-    def __init__(self):
+    def __init__(self, use_camera: bool = True):
 
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -90,11 +90,11 @@ class RealtimePipeline:
         # =================================================
         # SETTINGS
         # =================================================
-        self.seq_len = 35
+        self.seq_len = 20
 
         self.motion_threshold = 0.0008
 
-        self.motion_required_frames = 4
+        self.motion_required_frames = 2
 
         self.prediction_threshold = 0.45
 
@@ -112,9 +112,13 @@ class RealtimePipeline:
         # =================================================
         # COMPONENTS
         # =================================================
-        self.extractor = PoseExtractor(
-            str(POSE_TASK_PATH)
-        )
+        # Only init extractor when running with local camera
+        if use_camera:
+            self.extractor = PoseExtractor(
+                str(POSE_TASK_PATH)
+            )
+        else:
+            self.extractor = None
 
         self.session = SessionManager()
 
@@ -139,10 +143,37 @@ class RealtimePipeline:
         self.countdown_active = False
 
         self.countdown_finished = False
-
-        self.countdown_start_time = None
+        self.inference_counter = 0
 
         self.countdown_seconds = 3
+
+        # --- Integrated from app.py ---
+        self.last_rep_time = time.time()
+        self.previous_reps = 0
+        # -----------------------------
+
+    # =====================================================
+    # RESET SESSION (preserves workout history)
+    # =====================================================
+    def reset_session(self):
+        """Reset pipeline state for a new exercise round, keeping session history."""
+        self.sequence_buffer = []
+        self.prediction_history.clear()
+        self.prev_features = None
+        self.rep_counter = None
+
+        self.allow_detection = False
+        self.motion_frames = 0
+        self.current_label = "WAITING"
+        self.current_confidence = 0.0
+        self.exercise_locked = False
+
+        self.countdown_active = False
+        self.countdown_finished = False
+        self.inference_counter = 0
+
+        self.last_rep_time = time.time()
+        self.previous_reps = 0
 
     # =====================================================
     # BUILD INPUT
@@ -268,20 +299,10 @@ class RealtimePipeline:
         # =================================================
         # STABILITY CHECKS
         # =================================================
-        if exercise_name in ["squat", "deadlift"]:
+        # Disabled for better mobile stability
+        angles_dict["feet_stable"] = True
 
-            left_ankle_y = landmarks[27].y
-
-            right_ankle_y = landmarks[28].y
-
-            # If difference in ankle height > 8% of frame, a foot is lifted!
-            if abs(left_ankle_y - right_ankle_y) > 0.08:
-
-                angles_dict["feet_stable"] = False
-
-            else:
-
-                angles_dict["feet_stable"] = True
+        pass
 
         return angles_dict
 
@@ -823,8 +844,196 @@ class RealtimePipeline:
         self.countdown_start_time = None
 
     # =====================================================
+    # PROCESS KEYPOINTS  (Flutter API mode)
+    # =====================================================
+    def process_keypoints(self, features, lm_proxies):
+        """
+        Called by api.py instead of process_frame().
+        features   : np.ndarray (39, 4)
+        lm_proxies : list of 39 LandmarkProxy objects (first 33 are real)
+        """
+        # =================================================
+        # MOTION DETECTION
+        # =================================================
+        if self.prev_features is None:
+            motion = 0.0
+        else:
+            motion = float(np.mean(
+                np.abs(features[:, :2] - self.prev_features[:, :2])
+            ))
+
+        self.prev_features = features.copy()
+
+        # =================================================
+        # WAIT FOR MOVEMENT
+        # =================================================
+        if not self.allow_detection:
+            if motion > self.motion_threshold:
+                self.motion_frames += 1
+            else:
+                self.motion_frames = max(0, self.motion_frames - 1)
+
+            if self.motion_frames >= self.motion_required_frames:
+                self.allow_detection = True
+                self.countdown_active = True
+                self.countdown_start_time = time.time()
+
+            return {
+                "state": "MOVE_TO_START",
+                "exercise": "WAITING",
+                "reps": 0,
+                "stage": None,
+                "feedback": [],
+                "confidence": 0.0,
+                "locked": False,
+                "good_reps": 0,
+                "bad_reps": 0,
+                "awaiting_decision": self.session.awaiting_decision,
+                "show_report": self.session.show_report
+            }
+
+        # =================================================
+        # COUNTDOWN
+        # =================================================
+        if self.countdown_active and not self.countdown_finished:
+            elapsed = int(time.time() - self.countdown_start_time)
+            remaining = self.countdown_seconds - elapsed
+            if remaining > 0:
+                return {
+                    "state": f"COUNTDOWN_{remaining}",
+                    "exercise": "WAITING",
+                    "reps": 0,
+                    "stage": None,
+                    "feedback": [],
+                    "confidence": 0.0,
+                    "locked": False,
+                    "good_reps": 0,
+                    "bad_reps": 0,
+                    "awaiting_decision": self.session.awaiting_decision,
+                    "show_report": self.session.show_report
+                }
+            else:
+                self.countdown_finished = True
+
+        # =================================================
+        # BUFFER
+        # =================================================
+        self.sequence_buffer.append(features)
+        if len(self.sequence_buffer) > self.seq_len:
+            self.sequence_buffer.pop(0)
+
+        if len(self.sequence_buffer) < self.seq_len:
+            return {
+                "state": "BUFFERING",
+                "exercise": "WAITING",
+                "reps": 0,
+                "stage": None,
+                "feedback": [],
+                "confidence": 0.0,
+                "locked": False,
+                "good_reps": 0,
+                "bad_reps": 0,
+                "awaiting_decision": self.session.awaiting_decision,
+                "show_report": self.session.show_report
+            }
+
+        # =================================================
+        # PREDICTION
+        # =================================================
+        movement_active = motion > self.motion_threshold
+
+        if not self.exercise_locked and movement_active:
+            from collections import Counter
+            
+            self.inference_counter += 1
+            if self.inference_counter % 5 == 0:
+                seq_np = np.array(self.sequence_buffer, dtype=np.float32)
+                inp = self._build_input(seq_np).to(self.device)
+                
+                with torch.no_grad():
+                    output = self.model(inp)
+                    probs = torch.softmax(output, dim=1)
+                    conf, pred = torch.max(probs, dim=1)
+                
+                self._cached_conf = conf.item()
+                self._cached_pred = IDX_TO_CLASS[pred.item()]
+
+            confidence_value = getattr(self, '_cached_conf', 0.0)
+            pred_name = getattr(self, '_cached_pred', 'WAITING')
+            self.current_confidence = confidence_value
+
+            if confidence_value >= self.prediction_threshold:
+                self.prediction_history.append(pred_name)
+
+            if len(self.prediction_history) >= 3:
+                pred_counter = Counter(self.prediction_history)
+                stable_pred, stable_count = pred_counter.most_common(1)[0]
+                if stable_count >= 2:
+                    self.current_label = stable_pred
+                    self.exercise_locked = True
+                    print(f"🔒 LOCKED: {stable_pred}")
+                    config = EXERCISE_COUNTER_RULES[stable_pred]
+                    self.rep_counter = RepCounter(
+                        config=config,
+                        min_frames_confirm=3
+                    )
+
+        # =================================================
+        # REP COUNTING
+        # =================================================
+        rep_data = None
+        movement_active = motion > self.motion_threshold
+
+        if self.exercise_locked and self.rep_counter is not None and movement_active:
+            angles_dict = self._build_angles_dict(self.current_label, lm_proxies)
+            if angles_dict is not None:
+                rep_data = self.rep_counter.update(angles_dict)
+
+        # =================================================
+        # UPDATE SESSION
+        # =================================================
+        current_reps = rep_data["reps"] if rep_data is not None else 0
+        if rep_data is not None and current_reps > 0:
+            good_reps = rep_data.get("good_reps", 0)
+            bad_reps  = rep_data.get("bad_reps", 0)
+            is_good_form = good_reps >= bad_reps
+        else:
+            is_good_form = True
+
+        self.session.update_exercise(self.current_label, current_reps, is_good_form)
+
+        # =================================================
+        # IDLE DETECTION (10 seconds)
+        # =================================================
+        if current_reps > self.previous_reps:
+            self.last_rep_time = time.time()
+            self.previous_reps = current_reps
+
+        idle_time = time.time() - self.last_rep_time
+        if current_reps > 0 and idle_time >= 5 and not self.session.awaiting_decision and not self.session.show_report:
+            self.session.awaiting_decision = True
+
+        # =================================================
+        # RETURN
+        # =================================================
+        return {
+            "state": "ACTIVE",
+            "exercise": self.current_label,
+            "reps": current_reps,
+            "stage": rep_data["stage"] if rep_data else None,
+            "confidence": round(self.current_confidence, 3),
+            "locked": self.exercise_locked,
+            "feedback": rep_data["feedback"] if rep_data else [],
+            "good_reps": rep_data.get("good_reps", 0) if rep_data else 0,
+            "bad_reps":  rep_data.get("bad_reps",  0) if rep_data else 0,
+            "awaiting_decision": self.session.awaiting_decision,
+            "show_report": self.session.show_report
+        }
+
+    # =====================================================
     # CLOSE
     # =====================================================
     def close(self):
 
-        self.extractor.close()
+        if self.extractor is not None:
+            self.extractor.close()
