@@ -132,6 +132,9 @@ class _SavedWorkoutDetailsScreenState extends State<SavedWorkoutDetailsScreen> {
       _savingSession = true;
     });
 
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+
     try {
       final sets = _readExerciseSets();
 
@@ -143,12 +146,14 @@ class _SavedWorkoutDetailsScreenState extends State<SavedWorkoutDetailsScreen> {
 
       if (!mounted) return;
 
-      _showSnackBar(
-        message: 'Session saved successfully',
-        backgroundColor: Colors.green,
+      scaffoldMessenger.showSnackBar(
+        const SnackBar(
+          content: Text('Session saved successfully'),
+          backgroundColor: Colors.green,
+        ),
       );
 
-      Navigator.pop(context, true);
+      navigator.pop(true);
     } catch (error) {
       if (!mounted) return;
 

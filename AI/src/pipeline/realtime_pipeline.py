@@ -90,13 +90,15 @@ class RealtimePipeline:
         # =================================================
         # SETTINGS
         # =================================================
-        self.seq_len = 20
+        self.seq_len = 15
 
-        self.motion_threshold = 0.0008
+        self.min_seq_len = 8  # Start inference early with padding
+
+        self.motion_threshold = 0.001
 
         self.motion_required_frames = 2
 
-        self.prediction_threshold = 0.45
+        self.prediction_threshold = 0.55
 
         # =================================================
         # BUFFERS
@@ -153,9 +155,9 @@ class RealtimePipeline:
         # -----------------------------
 
     # =====================================================
-    # RESET SESSION (preserves workout history)
+    # RESET PIPELINE STATE (preserves session data)
     # =====================================================
-    def reset_session(self):
+    def _reset_pipeline_state(self):
         """Reset pipeline state for a new exercise round, keeping session history."""
         self.sequence_buffer = []
         self.prediction_history.clear()
@@ -191,6 +193,76 @@ class RealtimePipeline:
         )
 
         return seq.unsqueeze(0)
+
+    # =====================================================
+    # BUILD INPUT WITH PADDING (for early inference)
+    # =====================================================
+    def _build_input_padded(self, seq_list):
+        """Build model input, zero-padding at the front if buffer isn't full yet."""
+        current = np.array(seq_list, dtype=np.float32)
+        current_len = len(seq_list)
+
+        if current_len < self.seq_len:
+            pad_len = self.seq_len - current_len
+            pad = np.zeros(
+                (pad_len, current.shape[1], current.shape[2]),
+                dtype=np.float32
+            )
+            current = np.concatenate([pad, current], axis=0)
+
+        return self._build_input(current)
+
+    # =====================================================
+    # ANGLE-BASED CONFUSION FILTER
+    # =====================================================
+    # Confusing pairs & their distinguishing angles
+    CONFUSION_PAIRS = {
+        ("lateral_raise", "shoulder_press"): {
+            "joints": (12, 14, 16),  # right: shoulder→elbow→wrist
+            # lateral_raise = straighter arm (elbow > 140)
+            # shoulder_press = bent arm (elbow < 130)
+            "lateral_raise_range": (130, 180),
+            "shoulder_press_range": (40, 140),
+        },
+        ("squat", "deadlift"): {
+            "joints": (24, 26, 28),  # right: hip→knee→ankle
+            # squat = deeper knee bend (< 120)
+            # deadlift = slight knee bend (> 120)
+            "squat_range": (50, 130),
+            "deadlift_range": (110, 180),
+        },
+    }
+
+    def _angle_bias(self, lm_proxies, pred_name, confidence):
+        """Adjust confidence based on current pose angles to reduce confusion."""
+        for (ex_a, ex_b), cfg in self.CONFUSION_PAIRS.items():
+            if pred_name not in (ex_a, ex_b):
+                continue
+
+            j1, j2, j3 = cfg["joints"]
+            try:
+                angle = calculate_angle(
+                    [lm_proxies[j1].x, lm_proxies[j1].y],
+                    [lm_proxies[j2].x, lm_proxies[j2].y],
+                    [lm_proxies[j3].x, lm_proxies[j3].y],
+                )
+            except (IndexError, AttributeError):
+                return confidence
+
+            # Check if angle fits the predicted exercise
+            pred_range = cfg.get(f"{pred_name}_range")
+            if pred_range is None:
+                return confidence
+
+            lo, hi = pred_range
+            if lo <= angle <= hi:
+                # Angle matches prediction → boost slightly
+                return min(confidence * 1.1, 1.0)
+            else:
+                # Angle contradicts prediction → penalize
+                return confidence * 0.4
+
+        return confidence
 
     # =====================================================
     # BUILD ANGLES DICT
@@ -307,36 +379,11 @@ class RealtimePipeline:
         return angles_dict
 
     # =====================================================
-    # RESET
+    # RESET SESSION (called by session_manager on restart)
     # =====================================================
     def reset_session(self):
-
-        self.session.reset()
-
-        self.rep_counter = None
-
-        self.sequence_buffer.clear()
-
-        self.prediction_history.clear()
-
-        self.prev_features = None
-
-        self.allow_detection = False
-
-        self.motion_frames = 0
-
-        self.current_label = "WAITING"
-
-        self.current_confidence = 0.0
-
-        self.exercise_locked = False
-
-        # countdown
-        self.countdown_active = False
-
-        self.countdown_finished = False
-
-        self.countdown_start_time = None
+        """Reset pipeline state only. Session data is managed by session_manager."""
+        self._reset_pipeline_state()
 
     # =====================================================
     # CURRENT STATE
@@ -361,7 +408,15 @@ class RealtimePipeline:
 
             countdown_value = remaining
 
+        if countdown_value is not None and countdown_value > 0:
+            ui_state = f"COUNTDOWN_{countdown_value}"
+        else:
+            ui_state = "SERVER_UPDATE"
+
         return {
+
+            "state":
+                ui_state,
 
             "exercise":
                 self.current_label,
@@ -395,6 +450,12 @@ class RealtimePipeline:
 
             "locked":
                 self.exercise_locked,
+
+            "awaiting_decision":
+                self.session.awaiting_decision,
+
+            "show_report":
+                self.session.show_report,
 
             "feedback": (
 
@@ -682,7 +743,7 @@ class RealtimePipeline:
                 # =========================================
                 # LOCK EXERCISE
                 # =========================================
-                if stable_count >= 2:
+                if stable_count >= 3:
 
                     self.current_label = stable_pred
 
@@ -705,6 +766,10 @@ class RealtimePipeline:
 
                         min_frames_confirm=3
                     )
+        elif not self.exercise_locked:
+            # Gradual decay instead of full clear — preserves recent progress
+            if len(self.prediction_history) > 0:
+                self.prediction_history.popleft()
 
         # =================================================
         # REP COUNTING
@@ -922,7 +987,8 @@ class RealtimePipeline:
         if len(self.sequence_buffer) > self.seq_len:
             self.sequence_buffer.pop(0)
 
-        if len(self.sequence_buffer) < self.seq_len:
+        # Start inference early with padding (min_seq_len frames)
+        if len(self.sequence_buffer) < self.min_seq_len:
             return {
                 "state": "BUFFERING",
                 "exercise": "WAITING",
@@ -941,25 +1007,37 @@ class RealtimePipeline:
         # PREDICTION
         # =================================================
         movement_active = motion > self.motion_threshold
+        # Use a lower threshold for inference - catch subtle movements
+        inference_active = motion > (self.motion_threshold * 0.3)
 
-        if not self.exercise_locked and movement_active:
+        self.inference_counter += 1
+        if self.inference_counter % 3 == 0:
+            print(f"[DEBUG] motion={motion:.6f} active={movement_active} inf_active={inference_active} "
+                  f"locked={self.exercise_locked} buf={len(self.sequence_buffer)}/{self.seq_len} "
+                  f"conf={self.current_confidence:.3f} hist={list(self.prediction_history)}")
+
+        # Run inference with relaxed motion check OR periodically even with low motion
+        should_infer = inference_active or (self.inference_counter % 3 == 0)
+        if not self.exercise_locked and should_infer:
             from collections import Counter
-            
-            self.inference_counter += 1
-            if self.inference_counter % 3 == 0:
+
+            # Use padded input if buffer isn't full yet
+            if len(self.sequence_buffer) < self.seq_len:
+                inp = self._build_input_padded(self.sequence_buffer).to(self.device)
+            else:
                 seq_np = np.array(self.sequence_buffer, dtype=np.float32)
                 inp = self._build_input(seq_np).to(self.device)
-                
-                with torch.no_grad():
-                    output = self.model(inp)
-                    probs = torch.softmax(output, dim=1)
-                    conf, pred = torch.max(probs, dim=1)
-                
-                self._cached_conf = conf.item()
-                self._cached_pred = IDX_TO_CLASS[pred.item()]
 
-            confidence_value = getattr(self, '_cached_conf', 0.0)
-            pred_name = getattr(self, '_cached_pred', 'WAITING')
+            with torch.no_grad():
+                output = self.model(inp)
+                probs = torch.softmax(output, dim=1)
+                conf, pred = torch.max(probs, dim=1)
+
+            confidence_value = conf.item()
+            pred_name = IDX_TO_CLASS[pred.item()]
+
+            # Apply angle-based confusion filter
+            confidence_value = self._angle_bias(lm_proxies, pred_name, confidence_value)
             self.current_confidence = confidence_value
 
             if confidence_value >= self.prediction_threshold:
@@ -968,10 +1046,10 @@ class RealtimePipeline:
             if len(self.prediction_history) >= 3:
                 pred_counter = Counter(self.prediction_history)
                 stable_pred, stable_count = pred_counter.most_common(1)[0]
-                if stable_count >= 2:
+                if stable_count >= 3:
                     self.current_label = stable_pred
                     self.exercise_locked = True
-                    print(f"🔒 LOCKED: {stable_pred}")
+                    print(f"🔒 LOCKED: {stable_pred} (angle-verified)")
                     config = EXERCISE_COUNTER_RULES[stable_pred]
                     self.rep_counter = RepCounter(
                         config=config,
@@ -982,9 +1060,8 @@ class RealtimePipeline:
         # REP COUNTING
         # =================================================
         rep_data = None
-        movement_active = motion > self.motion_threshold
 
-        if self.exercise_locked and self.rep_counter is not None and movement_active:
+        if self.exercise_locked and self.rep_counter is not None:
             angles_dict = self._build_angles_dict(self.current_label, lm_proxies)
             if angles_dict is not None:
                 rep_data = self.rep_counter.update(angles_dict)
@@ -993,14 +1070,21 @@ class RealtimePipeline:
         # UPDATE SESSION
         # =================================================
         current_reps = rep_data["reps"] if rep_data is not None else 0
+        current_feedback = rep_data.get("feedback", []) if rep_data else []
         if rep_data is not None and current_reps > 0:
             good_reps = rep_data.get("good_reps", 0)
             bad_reps  = rep_data.get("bad_reps", 0)
             is_good_form = good_reps >= bad_reps
         else:
+            good_reps = 0
+            bad_reps = 0
             is_good_form = True
 
-        self.session.update_exercise(self.current_label, current_reps, is_good_form)
+        self.session.update_exercise(
+            self.current_label, current_reps, is_good_form,
+            good_reps=good_reps, bad_reps=bad_reps,
+            feedback=current_feedback
+        )
 
         # =================================================
         # IDLE DETECTION (10 seconds)
@@ -1010,7 +1094,7 @@ class RealtimePipeline:
             self.previous_reps = current_reps
 
         idle_time = time.time() - self.last_rep_time
-        if current_reps > 0 and idle_time >= 5 and not self.session.awaiting_decision and not self.session.show_report:
+        if current_reps > 0 and idle_time >= 6 and not self.session.awaiting_decision and not self.session.show_report:
             self.session.awaiting_decision = True
 
         # =================================================

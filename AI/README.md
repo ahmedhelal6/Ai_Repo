@@ -1,6 +1,6 @@
 # AI Fitness Coach 🏋️‍♂️
 
-An end-to-end, real-time AI fitness coaching ecosystem. This project combines a high-performance Flutter mobile application with a FastAPI backend powered by Spatial-Temporal Graph Convolutional Networks (ST-GCN).
+An end-to-end, real-time AI fitness coaching ecosystem. This project combines a high-performance Futter mobile application with a FastAPI backend powered by Spatial-Temporal Graph Convolutional Networks (ST-GCN).
 
 It doesn't just count reps; it understands human motion, provides real-time form correction, and generates comprehensive performance reports.
 

@@ -1,18 +1,67 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:math';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
-import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:web_socket_channel/io.dart';
+
+/// Device rotation → degrees (Android ML Kit `InputImage`, see google_ml_kit example).
+final Map<DeviceOrientation, int> _deviceOrientationDegrees = {
+  DeviceOrientation.portraitUp: 0,
+  DeviceOrientation.landscapeLeft: 90,
+  DeviceOrientation.portraitDown: 180,
+  DeviceOrientation.landscapeRight: 270,
+};
 
 // =========================================================
 // CONFIG — غيّر الـ IP لو التليفون والـ PC على نفس الـ WiFi
 // =========================================================
-const String _kPythonHost = '192.168.1.12'; // Android emulator → localhost
-// const String _kPythonHost = '192.168.1.X'; // جهاز حقيقي
+const String _kPythonHost = '192.168.1.12'; 
+// const String _kPythonHost = '10.0.2.2'; 
 const int _kPythonPort = 8000;
+
+const Duration _kCameraInitTimeout = Duration(seconds: 25);
+
+// =========================================================
+// EMULATOR CAMERA COMPENSATION
+// Adjust _kCameraOffsetX to center the camera on your emulator.
+// Positive = shift view right, Negative = shift left.
+// Set to 0.0 when running on a real phone.
+// =========================================================
+const double _kCameraOffsetX = 0.0;
+const double _kCameraScale = 1.0;
+
+/// Try lower resolutions after failures (emulators often fail `open | onError` on medium/front).
+const List<ResolutionPreset> _coachResolutionOrder = [
+  ResolutionPreset.medium,
+  ResolutionPreset.low,
+  ResolutionPreset.high,
+];
+
+List<CameraDescription> _coachCameraOrder(List<CameraDescription> cameras) {
+  int lensRank(CameraDescription c) {
+    switch (c.lensDirection) {
+      case CameraLensDirection.front:
+        return 0;
+      case CameraLensDirection.back:
+        return 1;
+      case CameraLensDirection.external:
+        return 2;
+    }
+  }
+
+  final sorted = [...cameras]..sort((a, b) {
+    final d = lensRank(a).compareTo(lensRank(b));
+    return d != 0 ? d : a.name.compareTo(b.name);
+  });
+  return sorted;
+}
 
 // =========================================================
 // AI COACH SCREEN
@@ -24,11 +73,11 @@ class AiCoachScreen extends StatefulWidget {
   State<AiCoachScreen> createState() => _AiCoachScreenState();
 }
 
-class _AiCoachScreenState extends State<AiCoachScreen>
-    with WidgetsBindingObserver {
+class _AiCoachScreenState extends State<AiCoachScreen> {
   // ----- Camera -----
   CameraController? _camera;
   bool _cameraReady = false;
+  String? _cameraError;
 
   // ----- ML Kit -----
   final PoseDetector _poseDetector = PoseDetector(
@@ -38,12 +87,16 @@ class _AiCoachScreenState extends State<AiCoachScreen>
   DateTime? _lastSentTime;
 
   // ----- WebSocket -----
-  WebSocketChannel? _channel;
+  IOWebSocketChannel? _channel;
+  StreamSubscription<dynamic>? _wsSub;
+  Timer? _reconnectTimer;
   bool _wsConnected = false;
+  bool _wsConnecting = false;
+  int _reconnectAttempts = 0;
 
   // ----- Result State -----
   String _exercise = '—';
-  String _state = 'Connecting...';
+  String _state = 'BOOT';
   int _reps = 0;
   String? _stage;
   List<String> _feedback = [];
@@ -57,96 +110,287 @@ class _AiCoachScreenState extends State<AiCoachScreen>
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _initAll();
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
+    _reconnectTimer?.cancel();
+    _wsSub?.cancel();
+    _wsSub = null;
+    try {
+      _channel?.sink.close();
+    } catch (_) {}
+    _channel = null;
     _camera?.dispose();
     _poseDetector.close();
-    _channel?.sink.close();
     super.dispose();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_camera == null || !_camera!.value.isInitialized) return;
-    if (state == AppLifecycleState.inactive) {
-      _camera!.dispose();
-    } else if (state == AppLifecycleState.resumed) {
-      _initCamera();
-    }
   }
 
   // =====================================================
   // INIT
   // =====================================================
-  Future<void> _initAll() async {
-    await _initCamera();
-    _initWebSocket();
+  void _initAll() {
+    unawaited(_connectWebSocket());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(_initCamera());
+    });
   }
 
   void _sendAction(String command) {
-    if (_wsConnected && _channel != null) {
-      _channel!.sink.add(jsonEncode({'command': command}));
+    final ch = _channel;
+    if (!_wsConnected || ch == null) return;
+    try {
+      ch.sink.add(jsonEncode({'command': command}));
+    } catch (e) {
+      debugPrint('WS send action failed: $e');
     }
   }
 
   Future<void> _initCamera() async {
-    final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
-
-    // استخدم الكاميرا الأمامية
-    final frontCamera = cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.front,
-      orElse: () => cameras.first,
-    );
-
-    _camera = CameraController(
-      frontCamera,
-      ResolutionPreset.medium,
-      imageFormatGroup: Platform.isAndroid
-          ? ImageFormatGroup.nv21
-          : ImageFormatGroup.bgra8888,
-      enableAudio: false,
-    );
-
-    await _camera!.initialize();
-
+    await _disposeCameraQuiet();
     if (!mounted) return;
 
-    setState(() => _cameraReady = true);
+    if (Platform.isAndroid || Platform.isIOS) {
+      var status = await Permission.camera.request();
+      if (!status.isGranted) {
+        if (mounted) {
+          setState(() {
+            _cameraError = status.isPermanentlyDenied
+                ? 'Camera blocked. Allow it from system app settings.'
+                : 'Camera permission is required for AI Coach.';
+          });
+        }
+        return;
+      }
+    }
 
-    _camera!.startImageStream(_onCameraFrame);
+    if (mounted) {
+      setState(() {
+        _cameraReady = false;
+        _cameraError = null;
+      });
+    }
+
+    late final List<CameraDescription> cameras;
+    try {
+      cameras = await availableCameras().timeout(_kCameraInitTimeout);
+    } on TimeoutException catch (e, st) {
+      debugPrint('availableCameras timeout: $e\n$st');
+      await _disposeCameraQuiet();
+      if (mounted) {
+        setState(
+          () =>
+              _cameraError = 'Camera service took too long. Cold-boot the emulator or Retry.',
+        );
+      }
+      return;
+    }
+
+    try {
+      if (!mounted) return;
+      if (cameras.isEmpty) {
+        setState(() => _cameraError = 'No cameras found');
+        return;
+      }
+
+      final cameraOrder = _coachCameraOrder(cameras);
+
+      Object? lastError;
+
+      outer:
+      for (final cam in cameraOrder) {
+        for (final preset in _coachResolutionOrder) {
+          if (!mounted) return;
+
+          await _disposeCameraQuiet();
+          try {
+            debugPrint(
+              'Camera trial: lens=${cam.lensDirection.name} '
+              'id=${cam.name} preset=${preset.name}',
+            );
+
+            _camera = CameraController(
+              cam,
+              preset,
+              enableAudio: false,
+              imageFormatGroup:
+                  Platform.isIOS
+                      ? ImageFormatGroup.bgra8888
+                      : ImageFormatGroup.nv21,
+            );
+
+            await _camera!.initialize().timeout(_kCameraInitTimeout);
+
+            if (!mounted) break outer;
+
+            await _camera!.startImageStream(_onCameraFrame).timeout(_kCameraInitTimeout);
+
+            if (!mounted) break outer;
+
+            setState(() {
+              _cameraReady = true;
+              _cameraError = null;
+            });
+
+            debugPrint('Camera OK: ${cam.name} @ ${preset.name}');
+            return;
+          } on TimeoutException catch (e, st) {
+            debugPrint('Camera trial timeout (${cam.name} ${preset.name}): $e\n$st');
+            lastError = e;
+          } catch (e, st) {
+            debugPrint(
+              'Camera trial failed (${cam.name} ${preset.name}): '
+              '${e.runtimeType}: $e\n$st',
+            );
+            lastError = e;
+          }
+        }
+      }
+
+      await _disposeCameraQuiet();
+      if (mounted) {
+        final emuTip =
+            Platform.isAndroid
+                ? '\n\nIf you use Android Emulator: Extended controls ⋮ → '
+                    'Camera → assign Webcam/virtual camera to Front and Back.'
+                : '';
+        if (lastError is TimeoutException) {
+          setState(() => _cameraError = 'Camera took too long to start. Retry.$emuTip');
+        } else if (lastError != null) {
+          setState(
+            () =>
+                _cameraError = 'Could not open any camera (${lastError.runtimeType}).$emuTip',
+          );
+        } else {
+          setState(() => _cameraError = 'Could not open camera.$emuTip');
+        }
+      }
+    } catch (e, st) {
+      debugPrint('Unexpected camera setup error: $e\n$st');
+      await _disposeCameraQuiet();
+      if (mounted) {
+        setState(() => _cameraError = 'Failed to initialize camera: $e');
+      }
+    }
   }
 
-  void _initWebSocket() {
+  Future<void> _disposeCameraQuiet() async {
     try {
-      final uri = Uri.parse('ws://$_kPythonHost:$_kPythonPort/ws/flutter_user');
-      _channel = WebSocketChannel.connect(uri);
+      await _camera?.dispose();
+    } catch (_) {}
+    _camera = null;
+    _cameraReady = false;
+  }
 
-      setState(() => _wsConnected = true);
+  Future<void> _disposeWebSocket({bool rebuildUi = true}) async {
+    final wasConnected = _wsConnected;
+    await _wsSub?.cancel();
+    _wsSub = null;
+    try {
+      await _channel?.sink.close();
+    } catch (_) {}
+    _channel = null;
+    _wsConnected = false;
+    if (rebuildUi && mounted && wasConnected) setState(() {});
+  }
 
-      // استقبال النتائج من Python
-      _channel!.stream.listen(
-        _onResult,
-        onError: (_) => setState(() => _wsConnected = false),
-        onDone: () => setState(() => _wsConnected = false),
-      );
-    } catch (_) {
-      setState(() => _wsConnected = false);
+  Duration _wsReconnectDelay() {
+    const caps = [1, 2, 4, 8, 16, 32];
+    final idx = min(_reconnectAttempts, caps.length - 1);
+    return Duration(seconds: caps[idx]);
+  }
+
+  void _scheduleWebSocketReconnect() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(_wsReconnectDelay(), () {
+      if (!mounted) return;
+      _reconnectAttempts = min(_reconnectAttempts + 1, 8);
+      unawaited(_connectWebSocket());
+    });
+  }
+
+  /// Opens the WS after TCP + WebSocket handshake (no need to wait for the first JSON from Python).
+  Future<void> _connectWebSocket({bool manual = false}) async {
+    if (_wsConnecting || !mounted) return;
+    if (manual) {
+      _reconnectTimer?.cancel();
+      _reconnectAttempts = 0;
     }
+
+    _wsConnecting = true;
+    await _disposeWebSocket(rebuildUi: true);
+
+    final uriStr = 'ws://$_kPythonHost:$_kPythonPort/ws/flutter_user';
+    debugPrint('Connecting to WebSocket: $uriStr');
+
+    try {
+      final ws = await WebSocket.connect(uriStr);
+      if (!mounted) {
+        await ws.close();
+        return;
+      }
+
+      _channel = IOWebSocketChannel(ws);
+      if (mounted) {
+        setState(() {
+          _wsConnected = true;
+          _reconnectAttempts = 0;
+        });
+      }
+
+      _wsSub = _channel!.stream.listen(
+        _onWsMessage,
+        onError: (Object err, StackTrace st) {
+          debugPrint('WS Error: $err');
+          if (!mounted) return;
+          unawaited(_disposeWebSocket(rebuildUi: true));
+          _scheduleWebSocketReconnect();
+        },
+        onDone: () {
+          debugPrint('WS Connection Closed');
+          if (!mounted) return;
+          unawaited(_disposeWebSocket(rebuildUi: true));
+          _scheduleWebSocketReconnect();
+        },
+        cancelOnError: true,
+      );
+    } catch (e) {
+      debugPrint('WS connect failed: $e');
+      if (mounted) _scheduleWebSocketReconnect();
+    } finally {
+      _wsConnecting = false;
+    }
+  }
+
+  void _onWsMessage(dynamic data) {
+    if (!mounted) return;
+    final payload = data is String
+        ? data
+        : (data is List<int> ? utf8.decode(data, allowMalformed: true) : null);
+    if (payload != null && payload.isNotEmpty) {
+      _onResult(payload);
+    }
+  }
+
+  Future<void> _manualReconnectWs() async {
+    _reconnectTimer?.cancel();
+    _reconnectAttempts = 0;
+    await _connectWebSocket(manual: true);
   }
 
   // =====================================================
   // CAMERA FRAME → ML Kit → WebSocket
   // =====================================================
   Future<void> _onCameraFrame(CameraImage image) async {
-    final now = DateTime.now();
+    if (_isProcessing || !_wsConnected || _showReport) return;
 
-    if (_isProcessing || !_wsConnected || _awaitingDecision || _showReport) return;
+    // Throttle pose pipeline (preview still runs at device rate).
+    final now = DateTime.now();
+    if (_lastSentTime != null && now.difference(_lastSentTime!).inMilliseconds < 150) {
+      return;
+    }
+
     _isProcessing = true;
     _lastSentTime = now;
 
@@ -158,25 +402,52 @@ class _AiCoachScreenState extends State<AiCoachScreen>
       if (poses.isEmpty) return;
 
       final keypoints = _poseToJson(poses.first, image.width.toDouble(), image.height.toDouble());
-      
-      // بعت الـ keypoints كـ Binary (أسرع بكتير من الـ JSON)
-      _channel!.sink.add(keypoints.buffer.asUint8List());
+      final ch = _channel;
+      if (!mounted || ch == null || !_wsConnected) return;
+      try {
+        ch.sink.add(keypoints.buffer.asUint8List());
+      } catch (e) {
+        debugPrint('WS send frame failed: $e');
+      }
+    } catch (e) {
+      debugPrint('Frame Error: $e');
     } finally {
       _isProcessing = false;
     }
   }
 
   InputImage? _toInputImage(CameraImage image) {
-    if (_camera == null) return null;
+    final controller = _camera;
+    if (controller == null || !controller.value.isInitialized) return null;
 
-    final camera = _camera!.description;
-    final rotation = InputImageRotationValue.fromRawValue(
-      camera.sensorOrientation,
-    );
+    final cameraDesc = controller.description;
+    final sensorOrientation = cameraDesc.sensorOrientation;
+
+    // Match google_ml_kit example (`camera_view.dart`): NV21 + rotation compensation on Android.
+    InputImageRotation? rotation;
+    if (Platform.isIOS) {
+      rotation = InputImageRotationValue.fromRawValue(sensorOrientation);
+    } else if (Platform.isAndroid) {
+      final deviceRotation = _deviceOrientationDegrees[controller.value.deviceOrientation];
+      if (deviceRotation == null) return null;
+
+      final int rotationCompensation;
+      if (cameraDesc.lensDirection == CameraLensDirection.front) {
+        rotationCompensation = (sensorOrientation + deviceRotation) % 360;
+      } else {
+        rotationCompensation = (sensorOrientation - deviceRotation + 360) % 360;
+      }
+      rotation = InputImageRotationValue.fromRawValue(rotationCompensation);
+    }
     if (rotation == null) return null;
 
     final format = InputImageFormatValue.fromRawValue(image.format.raw);
-    if (format == null) return null;
+    if (format == null ||
+        (Platform.isAndroid && format != InputImageFormat.nv21) ||
+        (Platform.isIOS && format != InputImageFormat.bgra8888)) {
+      return null;
+    }
+    if (image.planes.length != 1) return null;
 
     final plane = image.planes.first;
 
@@ -228,7 +499,9 @@ class _AiCoachScreenState extends State<AiCoachScreen>
 
       if (!mounted) return;
       setState(() {
-        _state = data['state'] ?? '—';
+        final nextState = data['state'];
+        _state =
+            nextState is String && nextState.isNotEmpty ? nextState : 'SERVER_UPDATE';
         _exercise = _formatExercise(data['exercise'] ?? '—');
         _reps = data['reps'] ?? 0;
         _stage = data['stage'];
@@ -238,7 +511,9 @@ class _AiCoachScreenState extends State<AiCoachScreen>
         _awaitingDecision = data['awaiting_decision'] ?? false;
         _showReport = data['show_report'] ?? false;
       });
-    } catch (_) {}
+    } catch (e, st) {
+      debugPrint('AI Coach reply parse failed: $e\n$st');
+    }
   }
 
   String _formatExercise(String raw) {
@@ -263,10 +538,50 @@ class _AiCoachScreenState extends State<AiCoachScreen>
           // Camera Preview
           // ------------------------------------------------
           if (_cameraReady && _camera != null)
-            CameraPreview(_camera!)
+            SizedBox.expand(
+              child: CameraPreview(_camera!),
+            )
+          else if (_cameraError != null)
+            Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.camera_alt_outlined, color: Colors.red, size: 60),
+                  const SizedBox(height: 16),
+                  Text('Camera Error: $_cameraError', style: const TextStyle(color: Colors.white)),
+                  TextButton(onPressed: _initCamera, child: const Text('Retry Camera')),
+                ],
+              ),
+            )
           else
             const Center(
               child: CircularProgressIndicator(color: Colors.redAccent),
+            ),
+
+          // ------------------------------------------------
+          // WebSocket Status & Overlay
+          // ------------------------------------------------
+          if (!_wsConnected)
+            Container(
+              color: Colors.black54,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.cloud_off, color: Colors.red, size: 60),
+                    const SizedBox(height: 16),
+                    const Text('Not connected to Python Server', style: TextStyle(color: Colors.white, fontSize: 18)),
+                    const SizedBox(height: 8),
+                    Text('Host: $_kPythonHost', style: const TextStyle(color: Colors.grey)),
+                    const SizedBox(height: 20),
+                    ElevatedButton(
+                      onPressed: () => _manualReconnectWs(),
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                      child: const Text('Try to Reconnect'),
+                    ),
+                  ],
+                ),
+              ),
             ),
 
           // ------------------------------------------------
@@ -438,6 +753,12 @@ class _AiCoachScreenState extends State<AiCoachScreen>
   String get _stateLabel {
     if (!_wsConnected) return '● Not connected to Python';
     switch (_state) {
+      case 'BOOT':
+        return '● Preparing…';
+      case 'CONNECTED':
+        return '● Connected — stand in camera view';
+      case 'SERVER_UPDATE':
+        return '● Updating session…';
       case 'MOVE_TO_START':
         return '● Move to start position';
       case 'BUFFERING':
@@ -591,6 +912,18 @@ class _AiCoachScreenState extends State<AiCoachScreen>
     if (!_showReport) return const SizedBox.shrink();
 
     final history = _reportData['workout_history'] as List<dynamic>? ?? [];
+    final summary = _reportData['summary'] as Map<String, dynamic>? ?? {};
+
+    final totalReps = summary['total_reps'] ?? 0;
+    final totalGood = summary['total_good_reps'] ?? 0;
+    final totalBad = summary['total_bad_reps'] ?? 0;
+    final overallScore = summary['overall_form_score'] ?? 100;
+
+    Color scoreColor(int score) {
+      if (score >= 80) return Colors.greenAccent;
+      if (score >= 60) return Colors.orangeAccent;
+      return Colors.redAccent;
+    }
 
     return Container(
       color: Colors.black,
@@ -608,7 +941,33 @@ class _AiCoachScreenState extends State<AiCoachScreen>
                   fontWeight: FontWeight.w900,
                 ),
               ),
-              const SizedBox(height: 32),
+              const SizedBox(height: 16),
+
+              // ===== SUMMARY BAR =====
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: .05),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: scoreColor(overallScore as int).withValues(alpha: .3),
+                  ),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    _reportStat('Exercises', '${history.length}', Colors.blueAccent),
+                    _reportStat('Total Reps', '$totalReps', Colors.white),
+                    _reportStat('Good', '$totalGood', Colors.greenAccent),
+                    _reportStat('Bad', '$totalBad', Colors.redAccent),
+                    _reportStat('Score', '$overallScore%', scoreColor(overallScore as int)),
+                  ],
+                ),
+              ),
+
+              const SizedBox(height: 16),
+
+              // ===== EXERCISE LIST =====
               Expanded(
                 child: history.isEmpty
                     ? const Center(
@@ -623,45 +982,99 @@ class _AiCoachScreenState extends State<AiCoachScreen>
                           final item = history[index] as Map<String, dynamic>;
                           final name = (item['exercise'] ?? '—') as String;
                           final reps = item['total_reps'] ?? 0;
-                          final goodForm = item['good_form'] ?? true;
+                          final goodReps = item['good_reps'] ?? 0;
+                          final badReps = item['bad_reps'] ?? 0;
+                          final formScore = item['form_score'] ?? 100;
+                          final mistakes = List<String>.from(item['top_mistakes'] ?? []);
+
                           return Container(
-                            margin: const EdgeInsets.only(bottom: 16),
+                            margin: const EdgeInsets.only(bottom: 12),
                             padding: const EdgeInsets.all(20),
                             decoration: BoxDecoration(
                               color: Colors.white.withValues(alpha: .05),
                               borderRadius: BorderRadius.circular(20),
                             ),
-                            child: Row(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
+                                // Exercise name + total reps
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
                                         name.toUpperCase().replaceAll('_', ' '),
                                         style: const TextStyle(
                                           color: Colors.white,
                                           fontWeight: FontWeight.bold,
+                                          fontSize: 16,
                                         ),
                                       ),
-                                      Text(
-                                        goodForm == true ? '✅ Good Form' : '⚠️ Needs Improvement',
-                                        style: TextStyle(
-                                          color: goodForm == true ? Colors.greenAccent : Colors.orangeAccent,
-                                          fontSize: 12,
-                                        ),
+                                    ),
+                                    Text(
+                                      '$reps',
+                                      style: const TextStyle(
+                                        color: Colors.greenAccent,
+                                        fontSize: 32,
+                                        fontWeight: FontWeight.w900,
                                       ),
-                                    ],
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 10),
+
+                                // Good/Bad reps + Form score
+                                Row(
+                                  children: [
+                                    _miniTag('✅ $goodReps good', Colors.greenAccent),
+                                    const SizedBox(width: 8),
+                                    _miniTag('❌ $badReps bad', Colors.redAccent),
+                                    const Spacer(),
+                                    Text(
+                                      'Form: $formScore%',
+                                      style: TextStyle(
+                                        color: scoreColor(formScore as int),
+                                        fontWeight: FontWeight.w800,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+
+                                // Form score bar
+                                const SizedBox(height: 8),
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(4),
+                                  child: LinearProgressIndicator(
+                                    value: (formScore as int) / 100.0,
+                                    backgroundColor: Colors.white.withValues(alpha: .1),
+                                    valueColor: AlwaysStoppedAnimation(scoreColor(formScore)),
+                                    minHeight: 4,
                                   ),
                                 ),
-                                Text(
-                                  '$reps',
-                                  style: const TextStyle(
-                                    color: Colors.greenAccent,
-                                    fontSize: 32,
-                                    fontWeight: FontWeight.w900,
-                                  ),
-                                ),
+
+                                // Mistakes
+                                if (mistakes.isNotEmpty) ...[
+                                  const SizedBox(height: 10),
+                                  ...mistakes.map((m) => Padding(
+                                    padding: const EdgeInsets.only(bottom: 2),
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.warning_amber_rounded,
+                                            color: Colors.orangeAccent.withValues(alpha: .7), size: 14),
+                                        const SizedBox(width: 6),
+                                        Expanded(
+                                          child: Text(
+                                            m,
+                                            style: TextStyle(
+                                              color: Colors.white.withValues(alpha: .6),
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  )),
+                                ],
                               ],
                             ),
                           );
@@ -687,6 +1100,32 @@ class _AiCoachScreenState extends State<AiCoachScreen>
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _reportStat(String label, String value, Color color) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(value, style: TextStyle(color: color, fontSize: 18, fontWeight: FontWeight.w900)),
+        const SizedBox(height: 2),
+        Text(label, style: const TextStyle(color: Colors.white38, fontSize: 10)),
+      ],
+    );
+  }
+
+  Widget _miniTag(String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: .2)),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w700),
       ),
     );
   }

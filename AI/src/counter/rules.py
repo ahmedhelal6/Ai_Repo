@@ -230,11 +230,11 @@ EXERCISE_COUNTER_RULES = {
             {
                 "angle_key": "arm",
 
-                "min_angle": 70,
+                "min_angle": 40,
                 "max_angle": 190,
 
                 "message":
-                "Keep wrists aligned!",
+                "Keep elbows at 90 degrees at bottom!",
 
                 "penalty": 10
             }

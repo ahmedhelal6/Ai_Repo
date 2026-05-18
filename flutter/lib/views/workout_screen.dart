@@ -204,6 +204,9 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
       _saving = true;
     });
 
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
+
     try {
       await controller.saveWorkout(
         name: workoutName,
@@ -212,8 +215,12 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
 
       if (!mounted) return;
 
-      _showSnackBar('Workout saved successfully');
-      Navigator.pop(context, true);
+      scaffoldMessenger.hideCurrentSnackBar();
+      scaffoldMessenger.showSnackBar(
+        const SnackBar(content: Text('Workout saved successfully')),
+      );
+      
+      navigator.pop(true);
     } catch (error) {
       if (!mounted) return;
 
@@ -235,66 +242,10 @@ class _WorkoutScreenState extends State<WorkoutScreen> {
   }
 
   Future<String?> _showSaveWorkoutDialog() async {
-    final textController = TextEditingController();
-    final formKey = GlobalKey<FormState>();
-
-    final result = await showDialog<String>(
+    return showDialog<String>(
       context: context,
-      builder: (context) {
-        return AlertDialog(
-          backgroundColor: const Color(0xFF161616),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
-          ),
-          title: const Text(
-            'Save Workout',
-            style: TextStyle(color: Colors.white),
-          ),
-          content: Form(
-            key: formKey,
-            child: TextFormField(
-              controller: textController,
-              autofocus: true,
-              style: const TextStyle(color: Colors.white),
-              decoration: InputDecoration(
-                hintText: 'Workout name',
-                hintStyle: const TextStyle(color: Colors.white54),
-                filled: true,
-                fillColor: Colors.white.withValues(alpha: .06),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  borderSide: BorderSide.none,
-                ),
-              ),
-              validator: (value) {
-                if (value == null || value.trim().isEmpty) {
-                  return 'Enter workout name';
-                }
-
-                return null;
-              },
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                if (formKey.currentState!.validate()) {
-                  Navigator.pop(context, textController.text.trim());
-                }
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        );
-      },
+      builder: (context) => const _SaveWorkoutDialog(),
     );
-
-    textController.dispose();
-    return result;
   }
 
   void _toggleExercise(ExerciseModel exercise) {
@@ -978,3 +929,73 @@ class _FilterChip extends StatelessWidget {
     );
   }
 }
+
+class _SaveWorkoutDialog extends StatefulWidget {
+  const _SaveWorkoutDialog();
+
+  @override
+  State<_SaveWorkoutDialog> createState() => _SaveWorkoutDialogState();
+}
+
+class _SaveWorkoutDialogState extends State<_SaveWorkoutDialog> {
+  final TextEditingController _textController = TextEditingController();
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    _textController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF161616),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(18),
+      ),
+      title: const Text(
+        'Save Workout',
+        style: TextStyle(color: Colors.white),
+      ),
+      content: Form(
+        key: _formKey,
+        child: TextFormField(
+          controller: _textController,
+          autofocus: true,
+          style: const TextStyle(color: Colors.white),
+          decoration: InputDecoration(
+            hintText: 'Workout name',
+            hintStyle: const TextStyle(color: Colors.white54),
+            filled: true,
+            fillColor: Colors.white.withValues(alpha: .06),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(14),
+              borderSide: BorderSide.none,
+            ),
+          ),
+          validator: (value) {
+            if (value == null || value.trim().isEmpty) {
+              return 'Enter workout name';
+            }
+            return null;
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            if (_formKey.currentState!.validate()) {
+              Navigator.pop(context, _textController.text.trim());
+            }
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
