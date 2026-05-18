@@ -39,7 +39,8 @@ lib/
 ├── models/               # Data structures for Landmarks & Workouts
 ├── services/             # WebSocket, API, and Notification logic
 └── utils/                # Constants, Themes, and Angle Calculators
-Flutter Installation
+---
+## Flutter Installation
 
 AI Fitness Coach can be installed and run as a Flutter mobile application. The application supports Android development using Flutter and can be tested on either an Android emulator or a physical Android device.
 
